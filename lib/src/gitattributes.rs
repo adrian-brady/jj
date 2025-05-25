@@ -19,7 +19,6 @@ use gix::glob as gix_glob;
 use gix::path as gix_path;
 use std::borrow::Cow;
 use std::io;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -48,6 +47,38 @@ impl GitAttributesFile {
         }
     }
 
+    pub fn test_matching(&self) {
+        println!("Testing gitattributes matching:");
+        let test_files = vec!["test.png", "image.jpg", "doc.txt", "assets/image.png"];
+
+        for file in test_files {
+            let matches = self.matches(file);
+            println!(" {} -> {}", file, matches);
+        }
+    }
+
+    pub fn debug_print_all_patterns(&self) {
+        dbg!(&self.search);
+    }
+
+    pub fn debug_match_for_path(&self, path: &str) {
+        let (candidate, is_dir) = if let Some(p) = path.strip_suffix('/') {
+            (p, true)
+        } else {
+            (path, false)
+        };
+        let case = gix_glob::pattern::Case::Sensitive;
+
+        println!("--- matching `{}` (is_dir={}) ---", candidate, is_dir);
+        dbg!(&self.search);
+
+        let mut out = gix_attrs::search::Outcome::default();
+        out.initialize_with_selection(&self.collection, ["filter"]);
+        self.search
+            .pattern_matching_relative_path(candidate.into(), case, Some(is_dir), &mut out);
+        dbg!(&out);
+    }
+
     pub fn chain(
         self: &Arc<GitAttributesFile>,
         prefix: PathBuf,
@@ -60,7 +91,11 @@ impl GitAttributesFile {
         let mut collection = self.collection.clone();
         let ignore_filters = self.ignore_filters.clone();
 
-        search.add_patterns_buffer(input, source_file, Some(&prefix), &mut collection, true);
+        let prefix_for_patterns = if prefix.as_os_str().is_empty() {
+            search.add_patterns_buffer(input, source_file, None, &mut collection, true);
+        } else {
+            search.add_patterns_buffer(input, source_file, Some(&prefix), &mut collection, true);
+        };
 
         Ok(Arc::new(GitAttributesFile {
             search,
@@ -79,29 +114,12 @@ impl GitAttributesFile {
         file: PathBuf,
     ) -> Result<Arc<GitAttributesFile>, GitAttributesError> {
         if file.is_file() {
-            let mut buf = Vec::new();
-            let mut search = self.search.clone();
-            let mut collection = self.collection.clone();
-            let ignore_filters = self.ignore_filters.clone();
-
-            search
-                .add_patterns_file(
-                    file.clone(),
-                    true,
-                    Some(Path::new(prefix)),
-                    &mut buf,
-                    &mut collection,
-                    true,
-                )
-                .map_err(|err| GitAttributesError::ReadFile {
-                    path: file.clone(),
-                    source: err,
-                })?;
-            Ok(Arc::new(GitAttributesFile {
-                search,
-                collection,
-                ignore_filters,
-            }))
+            let buf = std::fs::read(&file).map_err(|err| GitAttributesError::ReadFile {
+                path: file.clone(),
+                source: err,
+            })?;
+            let repo_prefix = PathBuf::from(prefix);
+            self.chain(repo_prefix, &buf)
         } else {
             Ok(self.clone())
         }
@@ -127,6 +145,21 @@ impl GitAttributesFile {
             .iter_selected()
             .filter_map(|attr| {
                 if let gix_attrs::StateRef::Value(value_ref) = attr.assignment.state {
+                    if let Some(source_path) = &attr.location.source {
+                        if let Some(source_str) = source_path.to_str() {
+                            if source_str.ends_with("/.gitattributes")
+                                && source_str != ".gitattributes"
+                            {
+                                if let Some(subdir) = source_str.strip_suffix("/.gitattributes") {
+                                    let required_prefix = format!("{}/", subdir);
+                                    let path_matches = path.starts_with(&required_prefix);
+                                    if !path_matches {
+                                        return None;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Some(value_ref.as_bstr())
                 } else {
                     None
@@ -193,9 +226,13 @@ mod tests {
 
     #[test]
     fn test_gitattributes_directory_match() {
-        assert!(matches(b"dir/ filter=lfs\n", "dir/file.txt"));
+        assert!(matches(b"dir/** filter=lfs\n", "dir/file.txt"));
+        assert!(matches(b"dir/* filter=lfs\n", "dir/file.txt"));
         assert!(matches(b"dir/ filter=lfs\n", "dir/"));
-        assert!(!matches(b"dir/ filter=lfs\n", "other/file.txt"));
+
+        assert!(!matches(b"dir/** filter=lfs\n", "other/file.txt"));
+        assert!(!matches(b"dir/* filter=lfs\n", "other/file.txt"));
+
         assert!(!matches(b"dir/ filter=lfs\n", "dir"));
     }
 
@@ -232,7 +269,6 @@ mod tests {
         let with_second = with_first
             .chain(PathBuf::from("subdir"), b"*.txt filter=text\n")
             .unwrap();
-        dbg!(&with_second);
 
         assert!(with_second.matches("file.bin"));
         assert!(with_second.matches("subdir/file.txt"));
@@ -241,9 +277,16 @@ mod tests {
 
     #[test]
     fn test_gitattributes_negated_pattern() {
-        let input = b"*.bin filter=lfs\n!important.bin filter=lfs\n";
-        assert!(matches(input, "file.bin"));
-        assert!(!matches(input, "important.bin"));
+        assert!(matches(b"*.bin filter=lfs\n", "file.bin"));
+        assert!(matches(b"*.bin filter=lfs\n", "important.bin"));
+        assert!(matches(
+            b"*.bin filter=lfs\nimportant.bin -filter",
+            "file.bin"
+        ));
+        assert!(!matches(
+            b"*.bin filter=lfs\nimportant.bin -filter",
+            "important.bin"
+        ));
     }
 
     #[test]

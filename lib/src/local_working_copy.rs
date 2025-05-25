@@ -1294,7 +1294,10 @@ impl FileSnapshotter<'_> {
                 // ignored directory must be ignored. It's also more efficient.
                 // start_tracking_matcher is NOT tested here because we need to
                 // scan directory entries to report untracked paths.
-                self.spawn_ok(scope, move |_| self.visit_tracked_files(file_states));
+                let git_attributes_clone = git_attributes.clone();
+                self.spawn_ok(scope, move |_| {
+                    self.visit_tracked_files(file_states, &git_attributes_clone)
+                });
             } else if !self.matcher.visit(&path).is_nothing() {
                 let directory_to_visit = DirectoryToVisit {
                     dir: path,
@@ -1366,7 +1369,11 @@ impl FileSnapshotter<'_> {
     }
 
     /// Visits only paths we're already tracking.
-    fn visit_tracked_files(&self, file_states: FileStates<'_>) -> Result<(), SnapshotError> {
+    fn visit_tracked_files<'scope>(
+        &self,
+        file_states: FileStates<'_>,
+        git_attributes: &'scope Arc<GitAttributesFile>,
+    ) -> Result<(), SnapshotError> {
         for (tracked_path, current_file_state) in file_states {
             if current_file_state.file_type == FileType::GitSubmodule {
                 continue;
@@ -1374,6 +1381,12 @@ impl FileSnapshotter<'_> {
             if !self.matcher.matches(tracked_path) {
                 continue;
             }
+            let path_string = tracked_path.as_internal_file_string();
+            if git_attributes.matches(path_string) {
+                self.deleted_files_tx.send(tracked_path.to_owned()).ok();
+                continue;
+            }
+
             let disk_path = tracked_path.to_fs_path(&self.tree_state.working_copy_path)?;
             let metadata = match disk_path.symlink_metadata() {
                 Ok(metadata) => Some(metadata),
