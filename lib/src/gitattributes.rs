@@ -323,3 +323,155 @@ mod tests {
         assert!(!with_other.matches("file.txt"));
     }
 }
+
+#[cfg(test)]
+mod comprehensive_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_git_crypt_patterns() {
+        let file = Arc::new(GitAttributesFile::new(&["git-crypt".to_string()]));
+
+        let patterns =
+            b"secrets/* filter=git-crypt\n*.key filter=git-crypt\ndatabase.conf filter=git-crypt\n";
+        let with_crypt = file.chain(PathBuf::new(), patterns).unwrap();
+
+        assert!(with_crypt.matches("secrets/api.key"));
+        assert!(with_crypt.matches("secrets/passwords.txt"));
+        assert!(with_crypt.matches("config.key"));
+        assert!(with_crypt.matches("database.conf"));
+
+        assert!(!with_crypt.matches("public/readme.txt"));
+        assert!(!with_crypt.matches("src/main.rs"));
+        assert!(!with_crypt.matches("config.json"));
+    }
+
+    #[test]
+    fn test_multiple_filters_interaction() {
+        let file = Arc::new(GitAttributesFile::new(&[
+            "lfs".to_string(),
+            "git-crypt".to_string(),
+            "custom".to_string(),
+        ]));
+
+        let patterns = b"*.large filter=lfs\n*.secret filter=git-crypt\n*.special filter=custom\n*.txt filter=lfs\n";
+        let multi_filter = file.chain(PathBuf::new(), patterns).unwrap();
+
+        // Each filter type should work
+        assert!(multi_filter.matches("file.large")); // LFS
+        assert!(multi_filter.matches("file.secret")); // git-crypt
+        assert!(multi_filter.matches("file.txt")); // LFS (should match because lfs is in ignore_filters)
+
+        // Custom filter should work too
+        assert!(multi_filter.matches("file.special")); // custom
+
+        // Non-matching files
+        assert!(!multi_filter.matches("file.normal"));
+    }
+
+    #[test]
+    fn test_complex_directory_structures() {
+        let file = Arc::new(GitAttributesFile::new(&["lfs".to_string()]));
+
+        // Root gitattributes
+        let root_patterns = b"*.bin filter=lfs\n";
+        let with_root = file.chain(PathBuf::new(), root_patterns).unwrap();
+
+        // Subdirectory gitattributes - deeper nesting
+        let sub1_patterns = b"*.tmp filter=lfs\n";
+        let with_sub1 = with_root
+            .chain(PathBuf::from("project/assets"), sub1_patterns)
+            .unwrap();
+
+        // Even deeper subdirectory
+        let sub2_patterns = b"*.cache filter=lfs\n";
+        let with_sub2 = with_sub1
+            .chain(PathBuf::from("project/assets/images"), sub2_patterns)
+            .unwrap();
+
+        // Test inheritance and scoping
+        assert!(with_sub2.matches("file.bin")); // Root pattern - global
+        assert!(with_sub2.matches("other/file.bin")); // Root pattern - global
+        assert!(with_sub2.matches("project/assets/temp.tmp")); // Sub1 pattern - scoped
+        assert!(with_sub2.matches("project/assets/images/thumb.cache")); // Sub2 pattern - scoped
+
+        // Test that subdirectory patterns don't leak
+        assert!(!with_sub2.matches("temp.tmp")); // Sub1 pattern outside scope
+        assert!(!with_sub2.matches("project/thumb.cache")); // Sub2 pattern outside scope
+        assert!(!with_sub2.matches("project/assets/thumb.cache")); // Sub2 pattern in wrong scope
+    }
+
+    #[test]
+    fn test_gitattributes_with_comments_and_whitespace() {
+        let file = Arc::new(GitAttributesFile::new(&["lfs".to_string()]));
+
+        // Real-world gitattributes with comments and varied formatting
+        let patterns = b"# LFS tracking\n*.psd filter=lfs\n\n# Binary files\n*.dll filter=lfs\n\n# Large text files\n*.log filter=lfs  \n";
+        let with_comments = file.chain(PathBuf::new(), patterns).unwrap();
+
+        assert!(with_comments.matches("design.psd"));
+        assert!(with_comments.matches("library.dll"));
+        assert!(with_comments.matches("debug.log"));
+        assert!(!with_comments.matches("readme.txt"));
+    }
+
+    #[test]
+    fn test_pattern_precedence_and_scoping() {
+        let file = Arc::new(GitAttributesFile::new(&["lfs".to_string()]));
+
+        // Root level patterns
+        let root_patterns = b"*.txt filter=lfs\n*.md filter=lfs\n";
+        let with_root = file.chain(PathBuf::new(), root_patterns).unwrap();
+
+        // Subdirectory adds additional patterns
+        let sub_patterns = b"*.log filter=lfs\n";
+        let with_subdirectory = with_root
+            .chain(PathBuf::from("logs"), sub_patterns)
+            .unwrap();
+
+        // Test that root patterns still work everywhere
+        assert!(with_subdirectory.matches("readme.txt"));
+        assert!(with_subdirectory.matches("docs/guide.txt"));
+        assert!(with_subdirectory.matches("changelog.md"));
+
+        // Test that subdirectory patterns only work in their scope
+        assert!(with_subdirectory.matches("logs/debug.log")); // In subdirectory
+        assert!(!with_subdirectory.matches("debug.log")); // Not in subdirectory
+        assert!(!with_subdirectory.matches("src/debug.log")); // Not in subdirectory
+
+        // Test inheritance - files in subdirectory get both root and local patterns
+        assert!(with_subdirectory.matches("logs/readme.txt")); // Root pattern applies in subdirectory
+        assert!(with_subdirectory.matches("logs/debug.log")); // Local pattern applies in subdirectory
+    }
+
+    #[test]
+    fn test_pattern_specificity() {
+        let file = Arc::new(GitAttributesFile::new(&[
+            "lfs".to_string(),
+            "other".to_string(),
+        ]));
+
+        // Test that more specific patterns can be added
+        let general_patterns = b"*.txt filter=lfs\n";
+        let with_general = file.chain(PathBuf::new(), general_patterns).unwrap();
+
+        // Add more specific patterns in a subdirectory
+        let specific_patterns = b"special.txt filter=other\n";
+        let with_specific = with_general
+            .chain(PathBuf::from("special"), specific_patterns)
+            .unwrap();
+
+        // General pattern still works at root
+        assert!(with_specific.matches("readme.txt"));
+
+        // General pattern works in subdirectory for non-specific files
+        assert!(with_specific.matches("special/readme.txt"));
+
+        // Specific pattern works for the specific file in subdirectory
+        assert!(with_specific.matches("special/special.txt"));
+
+        // Specific pattern doesn't affect root level
+        assert!(with_specific.matches("special.txt")); // This should match the general lfs pattern, not other
+    }
+}
